@@ -16,14 +16,17 @@ Note on test structure:
 import torch
 import pytest
 import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
+from nanochat.flash_attention import flash_attn, ATTENTION_BACKEND, HAS_FA3, HAS_FA4
 from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
+    """Set the implementation override and refresh module-level backend state."""
     fa_module._override_impl = impl
+    fa_module.ATTENTION_BACKEND = fa_module._resolve_attention_backend()
+    fa_module.ATTENTION_BACKEND_REASON = fa_module._resolve_attention_backend_reason()
     fa_module.USE_FA3 = fa_module._resolve_use_fa3()
+    fa_module.USE_FA4 = fa_module._resolve_use_fa4()
 
 
 def run_both_impls(fn):
@@ -345,18 +348,29 @@ class TestOverrideMechanism:
         """Test that override='fa3' uses FA3."""
         set_impl('fa3')
         assert fa_module.USE_FA3 == True
+        assert fa_module.ATTENTION_BACKEND == "fa3"
+        set_impl(None)
+
+    @pytest.mark.skipif(not HAS_FA4, reason="FA4 required")
+    def test_override_fa4(self):
+        """Test that override='fa4' uses FA4."""
+        set_impl('fa4')
+        assert fa_module.USE_FA4 == True
+        assert fa_module.ATTENTION_BACKEND == "fa4"
         set_impl(None)
 
     def test_override_sdpa(self):
         """Test that override='sdpa' uses SDPA."""
         set_impl('sdpa')
         assert fa_module.USE_FA3 == False
+        assert fa_module.USE_FA4 == False
+        assert fa_module.ATTENTION_BACKEND == "sdpa"
         set_impl(None)
 
     def test_override_auto(self):
         """Test that override=None uses auto-detection."""
         set_impl(None)
-        assert fa_module.USE_FA3 == HAS_FA3
+        assert fa_module.ATTENTION_BACKEND == fa_module._resolve_attention_backend()
 
 
 if __name__ == "__main__":
@@ -367,6 +381,8 @@ if __name__ == "__main__":
         major, minor = torch.cuda.get_device_capability()
         print(f"Compute capability: {major}.{minor}")
     print(f"HAS_FA3: {HAS_FA3}")
+    print(f"HAS_FA4: {HAS_FA4}")
+    print(f"ATTENTION_BACKEND: {ATTENTION_BACKEND}")
     print()
 
     pytest.main([__file__, "-v", "-s"])

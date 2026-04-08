@@ -5,6 +5,8 @@
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 
+This repository is Changqing Fu's personal fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). In addition to the upstream speedrun path, this fork carries Blackwell/B300 experimentation helpers for controlled FOG-family BF16 vs FP8 vs FP4 pretraining comparisons.
+
 For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
 
 ## Time-to-GPT-2 Leaderboard
@@ -100,6 +102,65 @@ The important thing to note is that nanochat is written and configured around on
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+## B300 Track 1
+
+For a pretraining-only Blackwell/B300 competition flow, use the `runs/b300_*.sh` entrypoints. These scripts assume the machine is already provisioned with a working CUDA/PyTorch stack and FlashAttention-4 for Blackwell. They do not create a `.venv`, do not use `uv`, and expect a shared artifact directory passed in as `BASE_DIR`.
+
+Typical flow:
+
+```bash
+BASE_DIR=/shared/nanochat/b300 bash runs/b300_prestage.sh
+BASE_DIR=/shared/nanochat/b300 bash runs/b300_smoke.sh
+```
+
+Multi-node training uses generic `torchrun` rendezvous settings on every node:
+
+```bash
+BASE_DIR=/shared/nanochat/b300 \
+NNODES=2 NODE_RANK=0 \
+MASTER_ADDR=10.0.0.10 MASTER_PORT=29500 \
+RUN_NAME=b300-track1 MODEL_TAG=b300_track1 NUM_ITERATIONS=2000 \
+bash runs/b300_train.sh
+```
+
+```bash
+BASE_DIR=/shared/nanochat/b300 \
+NNODES=2 NODE_RANK=1 \
+MASTER_ADDR=10.0.0.10 MASTER_PORT=29500 \
+RUN_NAME=b300-track1 MODEL_TAG=b300_track1 NUM_ITERATIONS=2000 \
+bash runs/b300_train.sh
+```
+
+The train script defaults to `WINDOW_PATTERN=auto`: it keeps the repo's patterned attention only when a real Flash Attention backend is selected, and otherwise forces `L` to avoid the pathological SDPA sliding-window path. `b300_smoke.sh` is stricter and fails fast if Flash Attention 4 is not actually active.
+
+## B300 FOG Comparison
+
+For matched FOG-family BF16 vs FP8 vs FP4 experiments on Blackwell, use `runs/fog_compare_b300.sh`. It keeps the tokenizer, dataset path, architecture, seed, batch schedule, eval cadence, and token budget fixed across all three arms while changing only `--precision-recipe`.
+
+Prerequisites:
+
+- Shared `BASE_DIR` already populated by `runs/b300_prestage.sh`
+- Blackwell-ready CUDA / PyTorch stack
+- NVIDIA Transformer Engine installed for the `fp8_full` and `fp4_blackwell` arms
+
+Example:
+
+```bash
+BASE_DIR=/shared/nanochat/b300 \
+RUN_NAME=fog-d24-compare \
+NUM_ITERATIONS=2000 \
+TOTAL_BATCH_SIZE=524288 \
+SEED=42 \
+bash runs/fog_compare_b300.sh
+```
+
+The script writes one summary directory at `"$BASE_DIR/comparisons/$RUN_NAME"` containing:
+
+- `comparison.json`
+- `comparison.md`
+
+Each row reports the comparison metrics that stay meaningful across precision recipes: `tok/sec`, step time, total train time, validation BPB, minimum validation BPB, and optional final CORE.
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
@@ -151,15 +212,23 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── dataset.py                  # Download/read utils for pretraining data
 │   ├── engine.py                   # Efficient model inference with KV Cache
 │   ├── execution.py                # Allows the LLM to execute Python code as tool
+│   ├── fog.py                      # FOG-family transformer for precision comparisons
 │   ├── gpt.py                      # The GPT nn.Module Transformer
 │   ├── logo.svg
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
+│   ├── model_factory.py            # Model-family config and instantiation helpers
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
+│   ├── precision.py                # Native vs Transformer Engine precision backends
 │   ├── report.py                   # Utilities for writing the nanochat Report
 │   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
 │   └── ui.html                     # HTML/CSS/JS for nanochat frontend
 ├── pyproject.toml
 ├── runs
+│   ├── b300_eval.sh                # Quick post-run base eval on CUDA
+│   ├── b300_prestage.sh            # Shared dataset/tokenizer prep for B300
+│   ├── b300_smoke.sh               # Single-node B300 smoke test
+│   ├── b300_train.sh               # Multi-node B300 pretraining launch
+│   ├── fog_compare_b300.sh         # Matched BF16/FP8/FP4 FOG comparison run
 │   ├── miniseries.sh               # Miniseries training script
 │   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
 │   ├── scaling_laws.sh             # Scaling laws experiments
@@ -184,6 +253,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
 │   └── spellingbee.py              # Task teaching model to spell/count letters
 ├── tests
+│   ├── test_attention_fallback.py  # Flash Attention backend/fallback tests
 │   └── test_engine.py
 └── uv.lock
 ```

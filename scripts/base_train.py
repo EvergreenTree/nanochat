@@ -18,21 +18,22 @@ import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import ATTENTION_BACKEND, ATTENTION_BACKEND_REASON, HAS_FLASH_ATTENTION, describe_attention_backend
+from nanochat.model_factory import build_model_config, build_model_from_config_kwargs, instantiate_model, model_config_to_dict
+from nanochat.precision import resolve_precision_backend
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -43,10 +44,14 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="global training seed used for model init and matched comparison runs")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+parser.add_argument("--precision-recipe", type=str, default="bf16", choices=["bf16", "fp8_full", "fp4_blackwell"], help="controlled precision recipe for the FOG family")
 # Model architecture
+parser.add_argument("--arch-family", type=str, default="nanochat", choices=["nanochat", "fog"], help="model family to train")
+parser.add_argument("--fog-variant", type=str, default="flash", choices=["flash", "opt"], help="FOG attention regularization variant")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -75,15 +80,20 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--quant-monitor-every", type=int, default=-1, help="monitor FOG kurtosis / backend quant stats every N steps (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.fp8 and args.arch_family == "fog":
+    parser.error("--fp8 is the legacy nanochat path. Use --precision-recipe for --arch-family=fog.")
+if args.precision_recipe != "bf16" and args.arch_family != "fog":
+    parser.error("--precision-recipe is only supported with --arch-family=fog. Use legacy --fp8 for nanochat.")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -94,23 +104,26 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+precision_backend = resolve_precision_backend(args.precision_recipe, device_type=device_type, gpu_name=gpu_device_name if device_type == "cuda" else None)
+print0(f"Precision recipe: {args.precision_recipe} ({precision_backend.reason})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+backend_name = describe_attention_backend(ATTENTION_BACKEND)
+using_flash_attention = ATTENTION_BACKEND in {"fa3", "fa4"}
+print0(f"Attention backend: {backend_name} ({ATTENTION_BACKEND_REASON})")
+if using_flash_attention:
+    print0(f"✓ Using {backend_name}.")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    if HAS_FLASH_ATTENTION and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention is available, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+        print0(f"WARNING: Using PyTorch SDPA fallback ({ATTENTION_BACKEND_REASON})")
+    print0("WARNING: Training will be less efficient without a Flash Attention backend")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
@@ -128,31 +141,47 @@ print0(f"Vocab size: {vocab_size:,}")
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+    config = build_model_config(
+        arch_family=args.arch_family,
+        depth=depth,
+        aspect_ratio=args.aspect_ratio,
+        head_dim=args.head_dim,
+        max_seq_len=args.max_seq_len,
+        vocab_size=vocab_size,
         window_pattern=args.window_pattern,
+        fog_variant=args.fog_variant,
     )
     with torch.device("meta"):
-        model_meta = GPT(config)
+        model_meta = instantiate_model(config, runtime_backend="native")
     return model_meta
 
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
-model_config = model.config
-model_config_kwargs = asdict(model_config)
+# Build the config once so all variants share the exact same architecture.
+model_config = build_model_config(
+    arch_family=args.arch_family,
+    depth=args.depth,
+    aspect_ratio=args.aspect_ratio,
+    head_dim=args.head_dim,
+    max_seq_len=args.max_seq_len,
+    vocab_size=vocab_size,
+    window_pattern=args.window_pattern,
+    fog_variant=args.fog_variant,
+)
+model_config_kwargs = model_config_to_dict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+if precision_backend.requires_materialized_construction:
+    with torch.device(device):
+        model = instantiate_model(model_config, runtime_backend=precision_backend.runtime_backend)
+    model.init_weights()
+else:
+    with torch.device("meta"):
+        model = instantiate_model(model_config, runtime_backend=precision_backend.runtime_backend)
+    model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+    model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+default_model_tag = f"d{args.depth}" if args.arch_family == "nanochat" else f"fog_{args.fog_variant}_d{args.depth}"
+output_dirname = args.model_tag if args.model_tag else default_model_tag
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -243,7 +272,12 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if device_type == "mps":
+    print0("WARNING: Skipping torch.compile on MPS due to unstable Metal codegen in current PyTorch.")
+elif args.arch_family == "fog":
+    print0("WARNING: Skipping torch.compile for FOG runs to keep TE integration and quant monitoring predictable.")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -423,7 +457,8 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            with precision_backend.eval_context():
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -442,7 +477,8 @@ while True:
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+            with precision_backend.eval_context():
+                results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -469,7 +505,8 @@ while True:
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                with precision_backend.eval_context():
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0, seed=args.seed)
             print0(tokenizer.decode(sample[0]))
         model.train()
 
@@ -504,11 +541,15 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    monitor_this_step = args.arch_family == "fog" and args.quant_monitor_every > 0 and step % args.quant_monitor_every == 0
+    if hasattr(orig_model, "set_quant_monitor_enabled"):
+        orig_model.set_quant_monitor_enabled(monitor_this_step)
     # evaluate the gradient
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        with precision_backend.training_context():
+            loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -542,6 +583,12 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    quant_log_data = {}
+    if monitor_this_step and hasattr(orig_model, "consume_quant_metrics"):
+        quant_log_data.update(orig_model.consume_quant_metrics())
+        quant_log_data.update(precision_backend.collect_debug_metrics(orig_model))
+    if hasattr(orig_model, "set_quant_monitor_enabled"):
+        orig_model.set_quant_monitor_enabled(False)
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -565,6 +612,16 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if quant_log_data:
+        preview_keys = [
+            "quant/qkv/kurtosis",
+            "quant/ffn_inner/kurtosis",
+            "quant/block_output/kurtosis",
+            "quant/backend_amax",
+        ]
+        summary_parts = [f"{key.split('/')[-2]}: {quant_log_data[key]:.4f}" for key in preview_keys if key in quant_log_data]
+        if summary_parts:
+            print0("quant | " + " | ".join(summary_parts))
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -577,7 +634,10 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        log_data.update(quant_log_data)
         wandb_run.log(log_data)
+    elif quant_log_data:
+        wandb_run.log({"step": step, **quant_log_data})
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -598,6 +658,34 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+completed_steps = max(num_iterations - 10, 0)
+avg_step_time = (total_training_time / completed_steps) if completed_steps > 0 else None
+avg_tok_per_sec = (int(total_batch_size / avg_step_time) if avg_step_time and avg_step_time > 0 else None)
+summary_data = {
+    "arch_family": args.arch_family,
+    "fog_variant": args.fog_variant if args.arch_family == "fog" else None,
+    "precision_recipe": args.precision_recipe,
+    "precision_backend": precision_backend.reason,
+    "attention_backend": describe_attention_backend(ATTENTION_BACKEND),
+    "seed": args.seed,
+    "model_tag": output_dirname,
+    "step": num_iterations,
+    "num_iterations": num_iterations,
+    "total_tokens": total_tokens,
+    "total_training_time_s": total_training_time,
+    "avg_step_time_s": avg_step_time,
+    "avg_tok_per_sec": avg_tok_per_sec,
+    "last_step_time_s": dt if "dt" in locals() else None,
+    "last_tok_per_sec": tok_per_sec if "tok_per_sec" in locals() else None,
+    "val_bpb": val_bpb,
+    "min_val_bpb": min_val_bpb if val_bpb is not None else None,
+    "core_metric": results.get("core_metric", None),
+}
+if master_process:
+    summary_path = os.path.join(checkpoint_dir, "training_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_data, f, indent=2)
+    print0(f"Wrote training summary to {summary_path}")
 
 # Log to report
 from nanochat.report import get_report
@@ -610,6 +698,8 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
+        "Arch family": args.arch_family,
+        "Precision recipe": args.precision_recipe,
         "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
@@ -622,6 +712,8 @@ get_report().log(section="Base model training", data=[
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Average step time (s)": avg_step_time,
+        "Average tok/sec": avg_tok_per_sec,
     }
 ])
 
