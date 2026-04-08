@@ -140,6 +140,11 @@ class FogSelfAttention(nn.Module):
         if quant_monitor is not None:
             qkv = torch.cat([q.reshape(bsz, seq_len, -1), k.reshape(bsz, seq_len, -1), v.reshape(bsz, seq_len, -1)], dim=-1)
             quant_monitor.record("quant/qkv", qkv)
+        if self.te_attention is not None and kv_cache is None and not self._use_te_attention(kv_cache, window_size):
+            raise RuntimeError(
+                "FOG Transformer Engine training path requires full-context attention (window_pattern=L). "
+                f"Layer {self.layer_idx} received window_size={window_size}."
+            )
 
         if self._use_te_attention(kv_cache, window_size):
             y = self.te_attention(q, k, v)

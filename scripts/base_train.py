@@ -33,7 +33,11 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import ATTENTION_BACKEND, ATTENTION_BACKEND_REASON, HAS_FLASH_ATTENTION, describe_attention_backend
 from nanochat.model_factory import build_model_config, build_model_from_config_kwargs, instantiate_model, model_config_to_dict
-from nanochat.precision import resolve_precision_backend
+from nanochat.precision import (
+    is_full_context_window_pattern,
+    precision_recipe_requires_full_context_window,
+    resolve_precision_backend,
+)
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -49,6 +53,8 @@ parser.add_argument("--seed", type=int, default=42, help="global training seed u
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 parser.add_argument("--precision-recipe", type=str, default="bf16", choices=["bf16", "fp8_full", "fp4_blackwell"], help="controlled precision recipe for the FOG family")
+parser.add_argument("--stochastic-rounding", type=str, default="auto", choices=["auto", "on", "off"], help="low-precision stochastic-rounding policy when exposed by the backend")
+parser.add_argument("--split-accumulator", type=str, default="auto", choices=["auto", "split", "fast"], help="low-precision split-accumulator policy when exposed by the backend")
 # Model architecture
 parser.add_argument("--arch-family", type=str, default="nanochat", choices=["nanochat", "fog"], help="model family to train")
 parser.add_argument("--fog-variant", type=str, default="flash", choices=["flash", "opt"], help="FOG attention regularization variant")
@@ -88,6 +94,15 @@ if args.fp8 and args.arch_family == "fog":
     parser.error("--fp8 is the legacy nanochat path. Use --precision-recipe for --arch-family=fog.")
 if args.precision_recipe != "bf16" and args.arch_family != "fog":
     parser.error("--precision-recipe is only supported with --arch-family=fog. Use legacy --fp8 for nanochat.")
+if (
+    args.arch_family == "fog"
+    and precision_recipe_requires_full_context_window(args.precision_recipe)
+    and not is_full_context_window_pattern(args.window_pattern)
+):
+    parser.error(
+        f"--precision-recipe={args.precision_recipe} requires full-context FOG attention. "
+        f"Use --window-pattern L (or an all-L equivalent), got '{args.window_pattern}'."
+    )
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -104,8 +119,15 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-precision_backend = resolve_precision_backend(args.precision_recipe, device_type=device_type, gpu_name=gpu_device_name if device_type == "cuda" else None)
+precision_backend = resolve_precision_backend(
+    args.precision_recipe,
+    device_type=device_type,
+    gpu_name=gpu_device_name if device_type == "cuda" else None,
+    stochastic_rounding=args.stochastic_rounding,
+    split_accumulator=args.split_accumulator,
+)
 print0(f"Precision recipe: {args.precision_recipe} ({precision_backend.reason})")
+print0(f"Precision controls: {precision_backend.describe_controls()}")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -666,6 +688,9 @@ summary_data = {
     "fog_variant": args.fog_variant if args.arch_family == "fog" else None,
     "precision_recipe": args.precision_recipe,
     "precision_backend": precision_backend.reason,
+    "precision_te_recipe": precision_backend.te_recipe_name,
+    "precision_stochastic_rounding": precision_backend.stochastic_rounding,
+    "precision_split_accumulator": precision_backend.split_accumulator,
     "attention_backend": describe_attention_backend(ATTENTION_BACKEND),
     "seed": args.seed,
     "model_tag": output_dirname,
@@ -700,6 +725,7 @@ get_report().log(section="Base model training", data=[
         "DDP world size": ddp_world_size,
         "Arch family": args.arch_family,
         "Precision recipe": args.precision_recipe,
+        "Precision controls": precision_backend.describe_controls(),
         "warmup_steps": args.warmup_steps,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,

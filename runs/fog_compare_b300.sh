@@ -45,6 +45,13 @@ EVAL_TOKENS="${EVAL_TOKENS:-1048576}"
 SAVE_EVERY="${SAVE_EVERY:-500}"
 QUANT_MONITOR_EVERY="${QUANT_MONITOR_EVERY:-100}"
 SEED="${SEED:-42}"
+FP4_STOCHASTIC_ROUNDING="${FP4_STOCHASTIC_ROUNDING:-on}"
+
+WINDOW_PATTERN="$(printf '%s' "$WINDOW_PATTERN" | tr '[:lower:]' '[:upper:]')"
+if [ -z "$WINDOW_PATTERN" ] || [ -n "${WINDOW_PATTERN//L/}" ]; then
+    echo "Error: fog_compare_b300.sh requires full-context FOG attention for the low-precision comparison. Set WINDOW_PATTERN=L." >&2
+    exit 1
+fi
 
 if [ ! -f "$BASE_DIR/tokenizer/token_bytes.pt" ]; then
     echo "Error: tokenizer artifacts are missing under $BASE_DIR/tokenizer. Run b300_prestage.sh first." >&2
@@ -79,6 +86,10 @@ run_arm() {
     local recipe="$1"
     local run_name="${RUN_NAME}-${recipe}"
     local model_tag="${MODEL_TAG_PREFIX}_${recipe}"
+    local extra_args=()
+    if [ "$recipe" = "fp4_blackwell" ]; then
+        extra_args+=(--stochastic-rounding="$FP4_STOCHASTIC_ROUNDING")
+    fi
     run_step torchrun \
         --nnodes="$NNODES" \
         --nproc_per_node="$NPROC_PER_NODE" \
@@ -87,6 +98,7 @@ run_arm() {
         --master_port="$MASTER_PORT" \
         -m scripts.base_train -- \
         "${COMMON_ARGS[@]}" \
+        "${extra_args[@]}" \
         --run="$run_name" \
         --model-tag="$model_tag" \
         --precision-recipe="$recipe"
