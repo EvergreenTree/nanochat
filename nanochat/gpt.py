@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- relu activation in MLP
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    mlp_activation: str = "relu"
 
 
 def norm(x):
@@ -78,6 +79,28 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.record_vo_covariances = False
+
+    @torch.compiler.disable
+    def _record_vo_covariances(self, x, h):
+        if not self.record_vo_covariances or self.n_kv_head != self.n_head or not torch.is_grad_enabled():
+            return
+        with torch.no_grad():
+            B, T, C = x.shape
+            count = B * T
+            x_flat = x.detach().reshape(count, C).float()
+            h_float = h.detach().float()
+            cov_x_sum = x_flat.mT @ x_flat
+            cov_h_sum = torch.einsum("bthd,bthe->hde", h_float, h_float)
+            weight = self.c_v.weight
+            if hasattr(weight, "_vo_cov_x_sum"):
+                weight._vo_cov_x_sum.add_(cov_x_sum)
+                weight._vo_cov_h_sum.add_(cov_h_sum)
+                weight._vo_cov_count += count
+            else:
+                weight._vo_cov_x_sum = cov_x_sum
+                weight._vo_cov_h_sum = cov_h_sum
+                weight._vo_cov_count = count
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -121,6 +144,7 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        self._record_vo_covariances(x, y)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -131,10 +155,15 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.activation = config.mlp_activation
+        if self.activation not in {"relu", "relu_squared"}:
+            raise ValueError(f"Unknown MLP activation: {self.activation}")
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.relu(x)
+        if self.activation == "relu_squared":
+            x = x.square()
         x = self.c_proj(x)
         return x
 
@@ -199,7 +228,13 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    def init_weights(self):
+    def init_weights(
+        self,
+        attn_c_proj_init="zero",
+        attn_c_proj_init_std=None,
+        mlp_c_proj_init="zero",
+        mlp_c_proj_init_std=None,
+    ):
         """
         Initialize the full model in this one function for maximum clarity.
 
@@ -209,10 +244,14 @@ class GPT(nn.Module):
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
-            attn.c_proj:     zeros
+            attn.c_proj:     zeros or normal, std=attn_c_proj_init_std
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
+            mlp.c_proj:      zeros or normal, std=mlp_c_proj_init_std
         """
+        if attn_c_proj_init not in {"zero", "gaussian"}:
+            raise ValueError(f"Unknown attn_c_proj_init: {attn_c_proj_init}")
+        if mlp_c_proj_init not in {"zero", "gaussian"}:
+            raise ValueError(f"Unknown mlp_c_proj_init: {mlp_c_proj_init}")
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
@@ -225,9 +264,17 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if attn_c_proj_init == "zero":
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            else:
+                std = n_embd**-0.5 if attn_c_proj_init_std is None else attn_c_proj_init_std
+                torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=std)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if mlp_c_proj_init == "zero":
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            else:
+                std = (4 * n_embd)**-0.5 if mlp_c_proj_init_std is None else mlp_c_proj_init_std
+                torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=std)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -366,19 +413,54 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        scalar_lr=0.5,
+        optimizer_kind="muon",
+        vo_lr_mult=1.0,
+        vo_beta2=0.9,
+        vo_wd_mult=1.0,
+        vo_eps=1e-8,
+        ffn_lr_mult=1.0,
+        ffn_beta2=0.9,
+        ffn_wd_mult=1.0,
+        matrix_adamw_beta1=0.9,
+        matrix_adamw_beta2=0.95,
+        matrix_adamw_wd_mult=1.0,
+    ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        if optimizer_kind not in {"muon", "adamw_all", "vo_product_muon", "paired_ffn"}:
+            raise ValueError(f"Unknown optimizer_kind: {optimizer_kind}")
+        if ddp and optimizer_kind in {"vo_product_muon", "paired_ffn"}:
+            raise NotImplementedError(f"{optimizer_kind} is only implemented for single-GPU training in v1")
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+
+        def iter_block_matrix_params():
+            for block in self.transformer.h:
+                yield block.attn.c_q.weight
+                yield block.attn.c_k.weight
+                yield block.attn.c_v.weight
+                yield block.attn.c_proj.weight
+                if block.attn.ve_gate is not None:
+                    yield block.attn.ve_gate.weight
+                yield block.mlp.c_fc.weight
+                yield block.mlp.c_proj.weight
+
+        transformer_matrix_params = list(iter_block_matrix_params())
+        legacy_matrix_params = list(self.transformer.h.parameters())
+        assert [id(p) for p in transformer_matrix_params] == [id(p) for p in legacy_matrix_params], "Explicit transformer matrix traversal changed default parameter order"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,13 +476,112 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+
+        matrix_params_muon = []
+        matrix_params_adamw = []
+        vo_params = []
+        vo_pair_offsets = []
+        vo_pairs_active = 0
+        vo_pairs_skipped = 0
+        ffn_params = []
+        ffn_pair_offsets = []
+        ffn_pairs_active = 0
+        ffn_pairs_skipped = 0
+        for block in self.transformer.h:
+            block.attn.record_vo_covariances = False
+
+        if optimizer_kind == "muon":
+            matrix_params_muon = transformer_matrix_params
+        elif optimizer_kind == "adamw_all":
+            matrix_params_adamw = transformer_matrix_params
+        elif optimizer_kind == "vo_product_muon":
+            for block in self.transformer.h:
+                wv = block.attn.c_v.weight
+                wo = block.attn.c_proj.weight
+                pair_ok = (
+                    wv.ndim == 2 and wo.ndim == 2 and
+                    wv.shape == wo.shape and
+                    wv.shape[0] == wv.shape[1]
+                )
+                matrix_params_muon.extend([block.attn.c_q.weight, block.attn.c_k.weight])
+                if pair_ok:
+                    offset = len(vo_params)
+                    vo_params.extend([wv, wo])
+                    vo_pair_offsets.append((offset, offset + 1))
+                    block.attn.record_vo_covariances = True
+                    vo_pairs_active += 1
+                else:
+                    matrix_params_muon.extend([wv, wo])
+                    vo_pairs_skipped += 1
+                if block.attn.ve_gate is not None:
+                    matrix_params_muon.append(block.attn.ve_gate.weight)
+                matrix_params_muon.extend([block.mlp.c_fc.weight, block.mlp.c_proj.weight])
+            print0(f"VO product Muon pairs active: {vo_pairs_active}, skipped: {vo_pairs_skipped}")
+        elif optimizer_kind == "paired_ffn":
+            for block in self.transformer.h:
+                matrix_params_muon.extend([
+                    block.attn.c_q.weight,
+                    block.attn.c_k.weight,
+                    block.attn.c_v.weight,
+                    block.attn.c_proj.weight,
+                ])
+                if block.attn.ve_gate is not None:
+                    matrix_params_muon.append(block.attn.ve_gate.weight)
+                win = block.mlp.c_fc.weight
+                wout = block.mlp.c_proj.weight
+                pair_ok = (
+                    win.ndim == 2 and wout.ndim == 2 and
+                    win.shape[0] == wout.shape[1] and
+                    win.shape[1] == wout.shape[0]
+                )
+                if pair_ok:
+                    offset = len(ffn_params)
+                    ffn_params.extend([win, wout])
+                    ffn_pair_offsets.append((offset, offset + 1))
+                    ffn_pairs_active += 1
+                else:
+                    matrix_params_muon.extend([win, wout])
+                    ffn_pairs_skipped += 1
+            print0(f"FFN joint Muon pairs active: {ffn_pairs_active}, skipped: {ffn_pairs_skipped}")
+
+        # AdamW matrix groups for the all-AdamW control, grouped by shape for parity with Muon.
+        for shape in sorted({p.shape for p in matrix_params_adamw}):
+            group_params = [p for p in matrix_params_adamw if p.shape == shape]
+            param_groups.append(dict(
+                kind='adamw', params=group_params, lr=matrix_lr,
+                betas=(matrix_adamw_beta1, matrix_adamw_beta2), eps=1e-10,
+                weight_decay=weight_decay * matrix_adamw_wd_mult,
+                matrix_group=True, weight_decay_mult=matrix_adamw_wd_mult,
+            ))
+
         # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        for shape in sorted({p.shape for p in matrix_params_muon}):
+            group_params = [p for p in matrix_params_muon if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
+
+        if vo_params:
+            param_groups.append(dict(
+                kind='vo_product_muon', params=vo_params, pair_offsets=vo_pair_offsets,
+                lr=matrix_lr * vo_lr_mult, momentum=0.95, ns_steps=5, beta2=vo_beta2,
+                weight_decay=weight_decay * vo_wd_mult, weight_decay_mult=vo_wd_mult,
+                eps=vo_eps, collect_stats=False,
+            ))
+        if ffn_params:
+            param_groups.append(dict(
+                kind='ffn_joint_muon', params=ffn_params, pair_offsets=ffn_pair_offsets,
+                lr=matrix_lr * ffn_lr_mult, momentum=0.95, ns_steps=5, beta2=ffn_beta2,
+                weight_decay=weight_decay * ffn_wd_mult, weight_decay_mult=ffn_wd_mult,
+                collect_stats=False,
+            ))
+
+        grouped_params = [p for group in param_groups for p in group["params"]]
+        grouped_param_ids = [id(p) for p in grouped_params]
+        model_param_ids = [id(p) for p in self.parameters()]
+        assert len(grouped_param_ids) == len(set(grouped_param_ids)), "Optimizer parameter groups contain duplicate parameters"
+        assert set(grouped_param_ids) == set(model_param_ids), "Optimizer parameter groups do not cover model parameters exactly"
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)

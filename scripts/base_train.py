@@ -52,6 +52,11 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--attn-c-proj-init", type=str, default="gaussian", choices=["gaussian", "zero"], help="attention output projection initialization for base pretraining")
+parser.add_argument("--attn-c-proj-init-std", type=float, default=-1.0, help="std for gaussian attention c_proj init (-1 = 1/sqrt(n_embd))")
+parser.add_argument("--mlp-c-proj-init", type=str, default="gaussian", choices=["gaussian", "zero"], help="MLP output projection initialization for base pretraining")
+parser.add_argument("--mlp-c-proj-init-std", type=float, default=-1.0, help="std for gaussian MLP c_proj init (-1 = 1/sqrt(4*n_embd))")
+parser.add_argument("--mlp-activation", type=str, default="relu", choices=["relu", "relu_squared"], help="MLP activation function")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -64,6 +69,20 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--optimizer-kind", type=str, default="muon", choices=["muon", "adamw_all", "vo_product_muon", "paired_ffn"], help="optimizer variant for transformer matrices")
+parser.add_argument("--vo-lr-mult", type=float, default=1.0, help="learning-rate multiplier for paired VO optimizer groups")
+parser.add_argument("--vo-beta2", type=float, default=0.9, help="second-moment beta for paired VO ls_muon variance reduction")
+parser.add_argument("--vo-wd-mult", type=float, default=1.0, help="weight-decay multiplier for paired VO optimizer groups")
+parser.add_argument("--vo-eps", type=float, default=1e-8, help="epsilon for paired VO split denominators")
+parser.add_argument("--vo-log-every", type=int, default=100, help="log paired VO optimizer diagnostics every N steps (-1 = disable)")
+parser.add_argument("--ffn-lr-mult", type=float, default=1.0, help="learning-rate multiplier for paired FFN optimizer groups")
+parser.add_argument("--ffn-beta2", type=float, default=0.9, help="second-moment beta for paired FFN joint Muon")
+parser.add_argument("--ffn-wd-mult", type=float, default=1.0, help="weight-decay multiplier for paired FFN optimizer groups")
+parser.add_argument("--ffn-log-every", type=int, default=100, help="log paired FFN optimizer diagnostics every N steps (-1 = disable)")
+parser.add_argument("--matrix-adamw-beta1", type=float, default=0.9, help="AdamW beta1 for transformer matrices when --optimizer-kind=adamw_all")
+parser.add_argument("--matrix-adamw-beta2", type=float, default=0.95, help="AdamW beta2 for transformer matrices when --optimizer-kind=adamw_all")
+parser.add_argument("--matrix-adamw-wd-mult", type=float, default=1.0, help="weight-decay multiplier for transformer matrix AdamW groups")
+parser.add_argument("--seed", type=int, default=42, help="global torch seed for model initialization")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -84,6 +103,9 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+torch.manual_seed(args.seed)
+if device_type == "cuda":
+    torch.cuda.manual_seed(args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -136,7 +158,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, mlp_activation=args.mlp_activation,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -148,7 +170,17 @@ model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+attn_c_proj_init_std = None if args.attn_c_proj_init_std < 0 else args.attn_c_proj_init_std
+mlp_c_proj_init_std = None if args.mlp_c_proj_init_std < 0 else args.mlp_c_proj_init_std
+model.init_weights(
+    attn_c_proj_init=args.attn_c_proj_init,
+    attn_c_proj_init_std=attn_c_proj_init_std,
+    mlp_c_proj_init=args.mlp_c_proj_init,
+    mlp_c_proj_init_std=mlp_c_proj_init_std,
+) # 3) All tensors get initialized
+print0(f"Attention c_proj init: {args.attn_c_proj_init}, std={attn_c_proj_init_std if attn_c_proj_init_std is not None else '1/sqrt(n_embd)'}")
+print0(f"MLP activation: {args.mlp_activation}")
+print0(f"MLP c_proj init: {args.mlp_c_proj_init}, std={mlp_c_proj_init_std if mlp_c_proj_init_std is not None else '1/sqrt(4*n_embd)'}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -158,6 +190,13 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    checkpoint_mlp_activation = meta_data.get("model_config", {}).get("mlp_activation", "relu_squared")
+    if checkpoint_mlp_activation != model.config.mlp_activation:
+        print0(f"Overriding MLP activation from CLI '{model.config.mlp_activation}' to checkpoint '{checkpoint_mlp_activation}'")
+        model.config.mlp_activation = checkpoint_mlp_activation
+        model_config_kwargs["mlp_activation"] = checkpoint_mlp_activation
+        for block in model.transformer.h:
+            block.mlp.activation = checkpoint_mlp_activation
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -243,7 +282,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if device_type == "mps":
+    print0("Skipping torch.compile on MPS because the Metal backend is still experimental")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -313,6 +355,17 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    optimizer_kind=args.optimizer_kind,
+    vo_lr_mult=args.vo_lr_mult,
+    vo_beta2=args.vo_beta2,
+    vo_wd_mult=args.vo_wd_mult,
+    vo_eps=args.vo_eps,
+    ffn_lr_mult=args.ffn_lr_mult,
+    ffn_beta2=args.ffn_beta2,
+    ffn_wd_mult=args.ffn_wd_mult,
+    matrix_adamw_beta1=args.matrix_adamw_beta1,
+    matrix_adamw_beta2=args.matrix_adamw_beta2,
+    matrix_adamw_wd_mult=args.matrix_adamw_wd_mult,
 )
 
 if resuming:
@@ -522,9 +575,19 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group['kind'] in ('muon', 'vo_product_muon', 'ffn_joint_muon'):
             group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+            group["weight_decay"] = muon_weight_decay * group.get("weight_decay_mult", 1.0)
+        elif group.get("matrix_group", False):
+            group["weight_decay"] = muon_weight_decay * group.get("weight_decay_mult", 1.0)
+        if group['kind'] == 'vo_product_muon':
+            collect_vo_stats = args.vo_log_every > 0 and step % args.vo_log_every == 0
+            group["collect_stats"] = collect_vo_stats
+            group["last_stats"] = None
+        elif group['kind'] == 'ffn_joint_muon':
+            collect_ffn_stats = args.ffn_log_every > 0 and step % args.ffn_log_every == 0
+            group["collect_stats"] = collect_ffn_stats
+            group["last_stats"] = None
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -537,6 +600,12 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    paired_log_data = {}
+    for group in optimizer.param_groups:
+        if group['kind'] in ('vo_product_muon', 'ffn_joint_muon') and group.get("last_stats") is not None:
+            paired_log_data.update(group["last_stats"])
+    if paired_log_data:
+        wandb_run.log({"step": step, **paired_log_data})
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
