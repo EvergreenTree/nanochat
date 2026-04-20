@@ -20,6 +20,24 @@ run_step() {
     "$@"
 }
 
+require_expected_shards() {
+    local num_train_shards="$1"
+    local shard_dir="$BASE_DIR/base_data_climbmix"
+    local idx shard_path
+    for ((idx = 0; idx < num_train_shards; idx++)); do
+        shard_path="$(printf '%s/shard_%05d.parquet' "$shard_dir" "$idx")"
+        [ -f "$shard_path" ] || {
+            echo "Error: expected train shard is missing after download: $shard_path" >&2
+            exit 1
+        }
+    done
+    shard_path="$(printf '%s/shard_%05d.parquet' "$shard_dir" 6542)"
+    [ -f "$shard_path" ] || {
+        echo "Error: expected validation shard is missing after download: $shard_path" >&2
+        exit 1
+    }
+}
+
 require_env BASE_DIR
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -57,6 +75,7 @@ if [ "$HAS_FA4" != "1" ]; then
 fi
 
 run_step python -m nanochat.dataset -n "$DATASET_SHARDS"
+require_expected_shards "$DATASET_SHARDS"
 run_step python -m scripts.tok_train --max-chars="$TOKENIZER_MAX_CHARS" --vocab-size="$VOCAB_SIZE"
 run_step python -m scripts.tok_eval
 
