@@ -354,6 +354,118 @@ def split_ffn_stacked_joint_direction(direction: Tensor, hidden_dim: int) -> tup
     dir_out = direction[hidden_dim:].mT
     return dir_in, dir_out
 
+def pop_ffn_pair_gate_mean(Win: Tensor) -> Tensor:
+    """Pop the accumulated FFN gate stats from c_fc.weight and return the mean."""
+    required = ("_ffn_pair_gate_sum", "_ffn_pair_gate_count")
+    if not all(hasattr(Win, name) for name in required):
+        raise RuntimeError("paired_ffn requires ffn_pair_gate_mean from a training forward pass")
+    count = max(1, int(Win._ffn_pair_gate_count))
+    gate_mean = Win._ffn_pair_gate_sum / count
+    for name in required:
+        delattr(Win, name)
+    return gate_mean
+
+def clear_ffn_pair_gate_attrs(Win: Tensor) -> None:
+    """Remove any stale FFN gate cache attrs from Win."""
+    for name in ("_ffn_pair_gate_sum", "_ffn_pair_gate_count"):
+        if hasattr(Win, name):
+            delattr(Win, name)
+
+def clear_vo_covariance_attrs(Wv: Tensor) -> None:
+    """Remove any stale VO covariance cache attrs from Wv."""
+    for name in ("_vo_cov_x_sum", "_vo_cov_h_sum", "_vo_cov_count"):
+        if hasattr(Wv, name):
+            delattr(Wv, name)
+
+def ffn_paired_correction(
+    Win: Tensor, Wout: Tensor,
+    Gin: Tensor, Gout: Tensor,
+    gate_mean: Tensor,
+    state_proxy: dict,
+    momentum: float,
+    ns_steps: int,
+    beta2: float | None,
+    eps: float = 1e-8,
+    g_floor: float = 1e-3,
+    is_signed_gate: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """
+    Compute the activation-aware paired correction directions for Win and Wout.
+
+    Win: c_fc.weight,   shape [m, n]   (hidden, model)
+    Wout: c_proj.weight, shape [n, m]   (model, hidden)
+    Gin, Gout: gradients matching parameter shapes
+    gate_mean: shape [m], batch-averaged activation derivative
+    Returns: (Cin, Cout) correction directions
+    """
+    g = gate_mean.detach().float()
+    if is_signed_gate:
+        # GLU-style gates can be negative; normalize by abs mean, no positive clamp
+        g = g / (g.abs().mean() + eps)
+    else:
+        g = g.clamp_min(g_floor)
+        g = g / (g.mean() + eps)
+
+    Win_f = Win.float()
+    Wout_f = Wout.float()
+    Gin_f = Gin.float()
+    Gout_f = Gout.float()
+
+    # Diagonal-gated weight views
+    DWin = g[:, None] * Win_f      # [m, n]
+    WoutD = Wout_f * g[None, :]    # [n, m]
+
+    # Proxy gradient: square [n, n] matrix
+    Gp = 0.5 * (Gout_f @ DWin + WoutD @ Gin_f)
+
+    # Muonize the proxy gradient
+    T = muonize_matrix(
+        Gp.to(dtype=Win.dtype),
+        state_proxy,
+        momentum=momentum,
+        ns_steps=ns_steps,
+        beta2=beta2,
+    ).float()
+
+    # Split back into per-parameter corrections
+    n = Win.shape[1]
+    den_in = (DWin.pow(2).sum() / n).clamp_min(eps)
+    den_out = (WoutD.pow(2).sum() / n).clamp_min(eps)
+
+    Cout = -0.5 * (T @ DWin.mT) / den_in     # [n, m]
+    Cin  = -0.5 * (WoutD.mT @ T) / den_out    # [m, n]
+
+    return Cin.to(dtype=Win.dtype), Cout.to(dtype=Wout.dtype)
+
+def blend_with_alignment_gating(
+    Uin: Tensor, Uout: Tensor,
+    Cin: Tensor, Cout: Tensor,
+    alpha_max: float,
+    schedule_val: float,
+    eps: float = 1e-8,
+) -> tuple[Tensor, Tensor, float]:
+    """
+    Blend Muon updates with paired correction using alignment gating.
+
+    Uin, Uout: ordinary Muon directions
+    Cin, Cout: paired correction directions
+    Returns: (dWin, dWout, alpha) blended directions and the alpha used
+    """
+    # Cosine similarity between Muon update and correction
+    def cosine(a, b):
+        a_f, b_f = a.float().flatten(), b.float().flatten()
+        return float(torch.dot(a_f, b_f) / (a_f.norm() * b_f.norm() + eps))
+
+    rho_out = cosine(Uout, Cout)
+    rho_in = cosine(Uin, Cin)
+    rho = 0.5 * (rho_out + rho_in)
+
+    alpha = alpha_max * schedule_val * max(rho, 0.0)
+
+    dWin = Uin + alpha * Cin.to(dtype=Uin.dtype)
+    dWout = Uout + alpha * Cout.to(dtype=Uout.dtype)
+    return dWin, dWout, alpha
+
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
 # Used mostly for reference, debugging and testing.
@@ -537,6 +649,7 @@ class MuonAdamW(torch.optim.Optimizer):
         for v_idx, o_idx in pair_offsets:
             Wv, Wo = params[v_idx], params[o_idx]
             if Wv.grad is None or Wo.grad is None:
+                clear_vo_covariance_attrs(Wv)
                 continue
 
             Gv, Go = Wv.grad, Wo.grad
@@ -662,6 +775,130 @@ class MuonAdamW(torch.optim.Optimizer):
         else:
             group["last_stats"] = None
 
+    def _step_paired_ffn(self, group: dict) -> None:
+        """
+        Activation-aware paired FFN optimizer. Computes ordinary Muon updates
+        for Win and Wout independently, then blends in a small paired correction
+        derived from the activation gate cached during the forward pass.
+
+        Params are stored flat as [Win0, Wout0, Win1, Wout1, ...], and
+        pair_offsets gives (in_idx, out_idx) positions into that list.
+        Win is c_fc.weight with shape (hidden, model); Wout is c_proj.weight
+        with shape (model, hidden).
+        """
+        params: list[Tensor] = group["params"]
+        pair_offsets = group["pair_offsets"]
+        alpha_max = group.get("ffn_pair_alpha_max", 0.2)
+        warmup_steps = group.get("ffn_pair_warmup_steps", 200)
+        eps = group.get("ffn_pair_eps", 1e-8)
+        g_floor = group.get("ffn_pair_g_floor", 1e-3)
+        collect_stats = group.get("collect_stats", False)
+        ramp_steps = group.get("ffn_pair_ramp_steps", warmup_steps)  # explicit ramp length
+        is_signed_gate = group.get("ffn_pair_activation_kind", "relu") == "gated_relu"
+        stats = dict(
+            num_pairs_active=0,
+            alpha_sum=0.0,
+            update_frob_in_sum=0.0,
+            update_frob_out_sum=0.0,
+            update_to_weight_ratio_in_sum=0.0,
+            update_to_weight_ratio_out_sum=0.0,
+        )
+
+        for in_idx, out_idx in pair_offsets:
+            Win, Wout = params[in_idx], params[out_idx]
+            if Win.grad is None or Wout.grad is None:
+                clear_ffn_pair_gate_attrs(Win)
+                continue
+
+            Gin, Gout = Win.grad, Wout.grad
+            state = self.state[Win]
+            state["step"] = state.get("step", 0) + 1
+            step = state["step"]
+
+            # --- Ordinary Muon updates for Win and Wout ---
+            if "muon_state_in" not in state:
+                state["muon_state_in"] = {}
+            if "muon_state_out" not in state:
+                state["muon_state_out"] = {}
+
+            Uin = muonize_matrix(
+                Gin, state["muon_state_in"],
+                momentum=group["momentum"],
+                ns_steps=group["ns_steps"],
+                beta2=group.get("beta2"),
+            )
+            Uout = muonize_matrix(
+                Gout, state["muon_state_out"],
+                momentum=group["momentum"],
+                ns_steps=group["ns_steps"],
+                beta2=group.get("beta2"),
+            )
+
+            # --- Paired correction (only after warmup) ---
+            pair_alpha = 0.0
+            if step >= warmup_steps:
+                gate_mean = pop_ffn_pair_gate_mean(Win)
+
+                if "proxy_state" not in state:
+                    state["proxy_state"] = {}
+
+                Cin, Cout = ffn_paired_correction(
+                    Win, Wout, Gin, Gout,
+                    gate_mean=gate_mean,
+                    state_proxy=state["proxy_state"],
+                    momentum=group["momentum"],
+                    ns_steps=group["ns_steps"],
+                    beta2=group.get("beta2"),
+                    eps=eps,
+                    g_floor=g_floor,
+                    is_signed_gate=is_signed_gate,
+                )
+
+                # Linear ramp from 0 to 1 over ramp_steps starting at warmup_steps
+                schedule_val = min(1.0, (step - warmup_steps + 1) / max(1, ramp_steps))
+
+                dir_in, dir_out, pair_alpha = blend_with_alignment_gating(
+                    Uin, Uout, Cin, Cout,
+                    alpha_max=alpha_max,
+                    schedule_val=schedule_val,
+                    eps=eps,
+                )
+            else:
+                # Before warmup: clear gate cache (discard), use pure Muon
+                clear_ffn_pair_gate_attrs(Win)
+                dir_in, dir_out = Uin, Uout
+
+            shape_lr_in = group["lr"] * max(1.0, Win.shape[-2] / Win.shape[-1])**0.5
+            shape_lr_out = group["lr"] * max(1.0, Wout.shape[-2] / Wout.shape[-1])**0.5
+
+            if collect_stats:
+                update_in = shape_lr_in * dir_in.float()
+                update_out = shape_lr_out * dir_out.float()
+                weight_in_norm = Win.float().norm().clamp_min(1e-12)
+                weight_out_norm = Wout.float().norm().clamp_min(1e-12)
+                stats["num_pairs_active"] += 1
+                stats["alpha_sum"] += pair_alpha
+                stats["update_frob_in_sum"] += float(update_in.norm().item())
+                stats["update_frob_out_sum"] += float(update_out.norm().item())
+                stats["update_to_weight_ratio_in_sum"] += float((update_in.norm() / weight_in_norm).item())
+                stats["update_to_weight_ratio_out_sum"] += float((update_out.norm() / weight_out_norm).item())
+
+            apply_cautious_update_(Win, dir_in, lr=shape_lr_in, wd=group["weight_decay"])
+            apply_cautious_update_(Wout, dir_out, lr=shape_lr_out, wd=group["weight_decay"])
+
+        if collect_stats:
+            n = max(1, stats["num_pairs_active"])
+            group["last_stats"] = {
+                "ffn/num_pairs_active": stats["num_pairs_active"],
+                "ffn/alpha_mean": stats["alpha_sum"] / n,
+                "ffn/update_frob_in_mean": stats["update_frob_in_sum"] / n,
+                "ffn/update_frob_out_mean": stats["update_frob_out_sum"] / n,
+                "ffn/update_to_weight_ratio_in": stats["update_to_weight_ratio_in_sum"] / n,
+                "ffn/update_to_weight_ratio_out": stats["update_to_weight_ratio_out_sum"] / n,
+            }
+        else:
+            group["last_stats"] = None
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -673,8 +910,11 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_vo_product_muon(group)
             elif group['kind'] == 'ffn_joint_muon':
                 self._step_ffn_joint_muon(group)
+            elif group['kind'] == 'paired_ffn':
+                self._step_paired_ffn(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
 
 # -----------------------------------------------------------------------------
 # Distributed version of the MuonAdamW optimizer.
@@ -739,7 +979,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
     def __init__(self, param_groups: list[dict]):
-        unsupported_kinds = {"vo_product_muon", "ffn_joint_muon"}
+        unsupported_kinds = {"vo_product_muon", "ffn_joint_muon", "paired_ffn"}
         unsupported = sorted({group.get("kind") for group in param_groups} & unsupported_kinds)
         if unsupported:
             raise NotImplementedError(f"{', '.join(unsupported)} is only implemented for single-GPU training in v1")

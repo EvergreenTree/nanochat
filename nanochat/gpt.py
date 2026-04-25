@@ -150,6 +150,29 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+def compute_ffn_pair_gate_mean(h, activation_kind, z=None):
+    """Compute batch-averaged hidden gate vector for paired FFN correction.
+
+    Args:
+        h: pre-activation hidden states, shape (B, T, m)
+        activation_kind: 'relu', 'relu2', or 'gated_relu'
+        z: gate path pre-activations for gated_relu, shape (B, T, m)
+
+    Returns:
+        gate_mean: shape (m,), mean activation derivative across batch and tokens
+    """
+    if activation_kind == "relu":
+        return (h > 0).float().mean(dim=(0, 1))
+    elif activation_kind == "relu2":
+        return (2.0 * torch.relu(h)).mean(dim=(0, 1))
+    elif activation_kind == "gated_relu":
+        if z is None:
+            raise ValueError("gated_relu requires z (gate pre-activations)")
+        return (torch.sigmoid(z) * (h > 0).float()).mean(dim=(0, 1))
+    else:
+        raise ValueError(f"Unknown ffn_pair activation_kind: {activation_kind}")
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -158,9 +181,30 @@ class MLP(nn.Module):
         self.activation = config.mlp_activation
         if self.activation not in {"relu", "relu_squared"}:
             raise ValueError(f"Unknown MLP activation: {self.activation}")
+        self.record_ffn_pair_gate = False
+        self.ffn_pair_activation_kind = "relu"
+
+    @torch.compiler.disable
+    def _record_ffn_pair_gate(self, h):
+        if not self.record_ffn_pair_gate or not torch.is_grad_enabled():
+            return
+        with torch.no_grad():
+            B, T, _m = h.shape
+            count = B * T
+            gate_sum = compute_ffn_pair_gate_mean(
+                h.detach(), self.ffn_pair_activation_kind
+            ) * count  # undo the mean to get a sum
+            weight = self.c_fc.weight
+            if hasattr(weight, "_ffn_pair_gate_sum"):
+                weight._ffn_pair_gate_sum.add_(gate_sum)
+                weight._ffn_pair_gate_count += count
+            else:
+                weight._ffn_pair_gate_sum = gate_sum
+                weight._ffn_pair_gate_count = count
 
     def forward(self, x):
         x = self.c_fc(x)
+        self._record_ffn_pair_gate(x)
         x = F.relu(x)
         if self.activation == "relu_squared":
             x = x.square()
@@ -428,6 +472,9 @@ class GPT(nn.Module):
         ffn_lr_mult=1.0,
         ffn_beta2=0.9,
         ffn_wd_mult=1.0,
+        ffn_pair_alpha_max=0.2,
+        ffn_pair_warmup_steps=200,
+        ffn_pair_activation_kind="relu",
         matrix_adamw_beta1=0.9,
         matrix_adamw_beta2=0.95,
         matrix_adamw_wd_mult=1.0,
@@ -539,10 +586,12 @@ class GPT(nn.Module):
                     ffn_params.extend([win, wout])
                     ffn_pair_offsets.append((offset, offset + 1))
                     ffn_pairs_active += 1
+                    block.mlp.record_ffn_pair_gate = True
+                    block.mlp.ffn_pair_activation_kind = ffn_pair_activation_kind
                 else:
                     matrix_params_muon.extend([win, wout])
                     ffn_pairs_skipped += 1
-            print0(f"FFN joint Muon pairs active: {ffn_pairs_active}, skipped: {ffn_pairs_skipped}")
+            print0(f"Paired FFN pairs active: {ffn_pairs_active}, skipped: {ffn_pairs_skipped} (activation: {ffn_pair_activation_kind})")
 
         # AdamW matrix groups for the all-AdamW control, grouped by shape for parity with Muon.
         for shape in sorted({p.shape for p in matrix_params_adamw}):
@@ -571,9 +620,13 @@ class GPT(nn.Module):
             ))
         if ffn_params:
             param_groups.append(dict(
-                kind='ffn_joint_muon', params=ffn_params, pair_offsets=ffn_pair_offsets,
+                kind='paired_ffn', params=ffn_params, pair_offsets=ffn_pair_offsets,
                 lr=matrix_lr * ffn_lr_mult, momentum=0.95, ns_steps=5, beta2=ffn_beta2,
                 weight_decay=weight_decay * ffn_wd_mult, weight_decay_mult=ffn_wd_mult,
+                ffn_pair_alpha_max=ffn_pair_alpha_max,
+                ffn_pair_warmup_steps=ffn_pair_warmup_steps,
+                ffn_pair_eps=1e-8, ffn_pair_g_floor=1e-3,
+                ffn_pair_activation_kind=ffn_pair_activation_kind,
                 collect_stats=False,
             ))
 

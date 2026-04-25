@@ -79,6 +79,9 @@ parser.add_argument("--ffn-lr-mult", type=float, default=1.0, help="learning-rat
 parser.add_argument("--ffn-beta2", type=float, default=0.9, help="second-moment beta for paired FFN joint Muon")
 parser.add_argument("--ffn-wd-mult", type=float, default=1.0, help="weight-decay multiplier for paired FFN optimizer groups")
 parser.add_argument("--ffn-log-every", type=int, default=100, help="log paired FFN optimizer diagnostics every N steps (-1 = disable)")
+parser.add_argument("--ffn-pair-alpha-max", type=float, default=0.2, help="max alpha for paired FFN correction blend")
+parser.add_argument("--ffn-pair-warmup-steps", type=int, default=200, help="steps before paired FFN correction activates")
+parser.add_argument("--ffn-pair-activation-kind", type=str, default="relu", choices=["relu", "relu2", "gated_relu"], help="activation gate for paired FFN correction")
 parser.add_argument("--matrix-adamw-beta1", type=float, default=0.9, help="AdamW beta1 for transformer matrices when --optimizer-kind=adamw_all")
 parser.add_argument("--matrix-adamw-beta2", type=float, default=0.95, help="AdamW beta2 for transformer matrices when --optimizer-kind=adamw_all")
 parser.add_argument("--matrix-adamw-wd-mult", type=float, default=1.0, help="weight-decay multiplier for transformer matrix AdamW groups")
@@ -363,6 +366,9 @@ optimizer = model.setup_optimizer(
     ffn_lr_mult=args.ffn_lr_mult,
     ffn_beta2=args.ffn_beta2,
     ffn_wd_mult=args.ffn_wd_mult,
+    ffn_pair_alpha_max=args.ffn_pair_alpha_max,
+    ffn_pair_warmup_steps=args.ffn_pair_warmup_steps,
+    ffn_pair_activation_kind=args.ffn_pair_activation_kind,
     matrix_adamw_beta1=args.matrix_adamw_beta1,
     matrix_adamw_beta2=args.matrix_adamw_beta2,
     matrix_adamw_wd_mult=args.matrix_adamw_wd_mult,
@@ -575,7 +581,7 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] in ('muon', 'vo_product_muon', 'ffn_joint_muon'):
+        if group['kind'] in ('muon', 'vo_product_muon', 'ffn_joint_muon', 'paired_ffn'):
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay * group.get("weight_decay_mult", 1.0)
         elif group.get("matrix_group", False):
@@ -584,7 +590,7 @@ while True:
             collect_vo_stats = args.vo_log_every > 0 and step % args.vo_log_every == 0
             group["collect_stats"] = collect_vo_stats
             group["last_stats"] = None
-        elif group['kind'] == 'ffn_joint_muon':
+        elif group['kind'] in ('ffn_joint_muon', 'paired_ffn'):
             collect_ffn_stats = args.ffn_log_every > 0 and step % args.ffn_log_every == 0
             group["collect_stats"] = collect_ffn_stats
             group["last_stats"] = None
@@ -602,7 +608,7 @@ while True:
         optimizer.step()
     paired_log_data = {}
     for group in optimizer.param_groups:
-        if group['kind'] in ('vo_product_muon', 'ffn_joint_muon') and group.get("last_stats") is not None:
+        if group['kind'] in ('vo_product_muon', 'ffn_joint_muon', 'paired_ffn') and group.get("last_stats") is not None:
             paired_log_data.update(group["last_stats"])
     if paired_log_data:
         wandb_run.log({"step": step, **paired_log_data})
